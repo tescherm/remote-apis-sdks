@@ -213,19 +213,25 @@ func buildCommand(ac *Action) *repb.Command {
 // ExecuteAndWait calls Execute on the underlying client and WaitExecution if necessary. It returns
 // the completed operation or an error.
 //
-// The retry logic is complicated. Assuming retries are enabled, we want the retry to call
-// WaitExecution if there's an Operation "in progress", and to call Execute otherwise. In practice
-// that means:
-//  1. If an error occurs before the first operation is returned, or after the final operation is
-//     returned (i.e. the one with op.Done==true), retry by calling Execute again.
-//  2. Otherwise, retry by calling WaitExecution with the last operation name.
+// Retry behavior:
+//   - Prefer WaitExecution when an Operation is in progress (i.e. we have seen an Operation with
+//     Done==false); otherwise call Execute.
+//   - If an error occurs before the first Operation is received, or after the final Operation is
+//     received (i.e. op.Done==true), retry by calling Execute again.
+//   - Otherwise, retry by calling WaitExecution with the last Operation name.
+//   - Special case: per the Remote Execution API spec, if WaitExecution returns NOT_FOUND, the next
+//     retry switches back to calling Execute.
 //
-// In addition, we want the retrier to trigger based on certain operation statuses as well as on
-// explicit errors. (The shouldRetry function knows which statuses.) We do this by mapping statuses,
-// if present, to errors inside the closure and then throwing away such "fake" errors outside the
-// closure (if we ran out of retries or if there was never a retrier enabled). The exception is
-// deadline-exceeded statuses, which we never give to the retrier (and hence will always propagate
-// directly to the caller).
+// Status-driven retries:
+//   - After the stream closes, if the last Operation carries a status, certain statuses are mapped to
+//     an error to drive the retrier (see shouldRetry). These mapped errors are discarded at the end, so
+//     the final return is the last Operation and a nil error.
+//   - DeadlineExceeded is never given to the retrier. For this case we do not retry and return the
+//     last Operation (with that status) and a nil error.
+//
+// Edge cases:
+//   - If the server returns no Operation (or an empty Operation) and no error, the call fails with an
+//     explicit error indicating unexpected server behavior.
 func (c *Client) ExecuteAndWait(ctx context.Context, req *repb.ExecuteRequest) (op *oppb.Operation, err error) {
 	return c.ExecuteAndWaitProgress(ctx, req, nil)
 }
@@ -242,6 +248,14 @@ func (c *Client) ExecuteAndWaitProgress(ctx context.Context, req *repb.ExecuteRe
 		var res regrpc.Execution_ExecuteClient
 		if wait {
 			res, e = c.WaitExecution(ctx, &repb.WaitExecutionRequest{Name: lastOp.Name})
+			// Per Remote Execution API spec, WaitExecution may return NOT_FOUND and
+			// clients should retry by issuing Execute again.
+			if e != nil {
+				if st, ok := status.FromError(e); ok && st.Code() == codes.NotFound {
+					wait = false
+				}
+				return e
+			}
 		} else {
 			res, e = c.Execute(ctx, req)
 		}
@@ -254,6 +268,12 @@ func (c *Client) ExecuteAndWaitProgress(ctx context.Context, req *repb.ExecuteRe
 				break
 			}
 			if e != nil {
+				// If WaitExecution stream returns NOT_FOUND, retry via Execute per the Remote Execution API spec.
+				if wait {
+					if st, ok := status.FromError(e); ok && st.Code() == codes.NotFound {
+						wait = false
+					}
+				}
 				return e
 			}
 			wait = !op.Done
